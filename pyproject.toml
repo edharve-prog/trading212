@@ -1,7 +1,7 @@
 [project]
 name = "t212bot"
 version = "0.1.0"
-description = "Swing-trading bot for the Trading212 API with indicator screening and Claude-assisted ranking"
+description = "Swing-trading bot for the Trading212 API with indicator screening and LLM-assisted ranking"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -10,6 +10,7 @@ dependencies = [
     "numpy>=1.26",
     "pandas>=2.2",
     "pyarrow>=16",
+    "PyJWT[crypto]>=2.10",
     "python-dotenv>=1.0",
     "yfinance>=0.2.50",
 ]
