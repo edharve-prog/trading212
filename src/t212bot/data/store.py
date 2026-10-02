@@ -41,9 +41,8 @@ class PriceStore:
             path = sym_dir / f"year={year}.parquet"
             if path.exists():
                 chunk = pd.concat([pd.read_parquet(path), chunk], ignore_index=True)
-            chunk = (
-                chunk.drop_duplicates("date", keep="last").sort_values("date").reset_index(drop=True)
-            )
+            chunk = chunk.drop_duplicates("date", keep="last").sort_values("date")
+            chunk = chunk.reset_index(drop=True)
             tmp = path.with_suffix(".parquet.tmp")
             chunk.to_parquet(tmp, index=False, compression="zstd")
             tmp.replace(path)
@@ -65,7 +64,10 @@ class PriceStore:
         start: date | None = None,
         end: date | None = None,
     ) -> pd.DataFrame:
-        """Return bars with a ``symbol`` column, sorted by symbol then date. ``end`` is inclusive."""
+        """Return bars with a ``symbol`` column, sorted by symbol then date.
+
+        ``end`` is inclusive.
+        """
         columns = ["symbol", *BAR_COLUMNS]
         if not self.root.exists() or not any(self.root.glob("symbol=*/*.parquet")):
             return pd.DataFrame(columns=columns)
