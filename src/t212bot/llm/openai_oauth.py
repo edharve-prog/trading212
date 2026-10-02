@@ -18,7 +18,7 @@ import time
 import uuid
 import webbrowser
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -233,11 +233,15 @@ class OpenAIOAuthClient:
         returned_client_id = callback.get("client_id")
         if existing:
             if returned_client_id and returned_client_id != existing.client_id:
-                raise OAuthError("OAuth callback returned a different client_id for the saved account")
+                raise OAuthError(
+                    "OAuth callback returned a different client_id for the saved account"
+                )
             issued_client_id = existing.client_id
         else:
             if not returned_client_id or returned_client_id == DYNAMIC_CLIENT_ID:
-                raise OAuthError("OpenAI did not return an issued client_id for the new registration")
+                raise OAuthError(
+                    "OpenAI did not return an issued client_id for the new registration"
+                )
             issued_client_id = returned_client_id
 
         token_response = self._post_token(
@@ -493,7 +497,9 @@ class OpenAIOAuthClient:
                 fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             except FileExistsError:
                 if time.monotonic() >= deadline:
-                    raise OAuthError("Timed out waiting for the OpenAI token refresh lock") from None
+                    raise OAuthError(
+                        "Timed out waiting for the OpenAI token refresh lock"
+                    ) from None
                 try:
                     age = time.time() - lock_path.stat().st_mtime
                     if age > 120:
@@ -506,10 +512,8 @@ class OpenAIOAuthClient:
             os.close(fd)
             yield
         finally:
-            try:
+            with suppress(FileNotFoundError):
                 lock_path.unlink()
-            except FileNotFoundError:
-                pass
 
     def _expires_at(self, profile: _Profile) -> datetime | None:
         if not profile.saved_at or not profile.expires_in:
