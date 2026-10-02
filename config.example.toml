@@ -1,0 +1,27 @@
+# Copy to config.toml and adjust. config.toml is git-ignored.
+
+[broker]
+# "demo" (practice account) or "live". Live order placement also needs allow_live = true.
+environment = "demo"
+allow_live = false
+# When true, order calls are logged and not sent.
+dry_run = true
+
+[paths]
+data_dir = "data"
+state_dir = "state"
+
+[universe]
+# Data-provider symbols (Yahoo style). Trading212 tickers are mapped separately.
+symbols = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "JPM", "XOM", "UNH", "COST"]
+benchmark = "SPY"
+history_start = "2010-01-01"
+
+[risk]
+# Used from phase 2 onwards; listed here so the limits live in one place.
+sleeve_fraction = 0.20
+risk_per_trade = 0.005
+max_position_fraction = 0.25
+max_open_positions = 5
+daily_loss_cap = 0.02
+drawdown_kill = 0.10
