@@ -48,11 +48,20 @@ class DataConfig:
 
 
 @dataclass(frozen=True)
+class LLMConfig:
+    provider: Literal["anthropic", "openai_oauth"] = "openai_oauth"
+    model: str = ""
+    openai_credential_path: str = "~/.config/t212bot/openai_oauth.json"
+    openai_callback_port: int = 1455
+
+
+@dataclass(frozen=True)
 class Settings:
     broker: BrokerConfig = field(default_factory=BrokerConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     universe: UniverseConfig = field(default_factory=UniverseConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
     data_dir: Path = Path("data")
     state_dir: Path = Path("state")
 
@@ -109,6 +118,24 @@ def load_settings(
         raise ConfigError(f"data.alpaca_feed must be 'sip' or 'iex', got {feed!r}")
     data = DataConfig(provider=provider, alpaca_feed=feed)
 
+    llm_raw = raw.get("llm", {})
+    llm_provider = llm_raw.get("provider", "openai_oauth")
+    if llm_provider not in ("anthropic", "openai_oauth"):
+        raise ConfigError(
+            f"llm.provider must be 'anthropic' or 'openai_oauth', got {llm_provider!r}"
+        )
+    callback_port = int(llm_raw.get("openai_callback_port", 1455))
+    if not 1 <= callback_port <= 65535:
+        raise ConfigError("llm.openai_callback_port must be between 1 and 65535")
+    llm = LLMConfig(
+        provider=llm_provider,
+        model=str(llm_raw.get("model", "")),
+        openai_credential_path=str(
+            llm_raw.get("openai_credential_path", "~/.config/t212bot/openai_oauth.json")
+        ),
+        openai_callback_port=callback_port,
+    )
+
     risk = RiskConfig(**raw.get("risk", {}))
     paths = raw.get("paths", {})
     base = path.parent if path.exists() else Path(".")
@@ -117,6 +144,7 @@ def load_settings(
         risk=risk,
         universe=universe,
         data=data,
+        llm=llm,
         data_dir=base / paths.get("data_dir", "data"),
         state_dir=base / paths.get("state_dir", "state"),
     )
