@@ -42,10 +42,17 @@ class UniverseConfig:
 
 
 @dataclass(frozen=True)
+class DataConfig:
+    provider: Literal["alpaca", "yfinance"] = "alpaca"
+    alpaca_feed: Literal["sip", "iex"] = "sip"
+
+
+@dataclass(frozen=True)
 class Settings:
     broker: BrokerConfig = field(default_factory=BrokerConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     universe: UniverseConfig = field(default_factory=UniverseConfig)
+    data: DataConfig = field(default_factory=DataConfig)
     data_dir: Path = Path("data")
     state_dir: Path = Path("state")
 
@@ -55,6 +62,13 @@ class Settings:
         secret = os.environ.get(f"{prefix}_API_SECRET", "")
         if not key or not secret:
             raise ConfigError(f"{prefix}_API_KEY and {prefix}_API_SECRET must be set in .env")
+        return key, secret
+
+    def alpaca_credentials(self) -> tuple[str, str]:
+        key = os.environ.get("ALPACA_API_KEY_ID", "")
+        secret = os.environ.get("ALPACA_API_SECRET_KEY", "")
+        if not key or not secret:
+            raise ConfigError("ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY must be set in .env")
         return key, secret
 
 
@@ -86,6 +100,15 @@ def load_settings(
         history_start=universe_raw.get("history_start", "2010-01-01"),
     )
 
+    data_raw = raw.get("data", {})
+    provider = data_raw.get("provider", "alpaca")
+    if provider not in ("alpaca", "yfinance"):
+        raise ConfigError(f"data.provider must be 'alpaca' or 'yfinance', got {provider!r}")
+    feed = data_raw.get("alpaca_feed", "sip")
+    if feed not in ("sip", "iex"):
+        raise ConfigError(f"data.alpaca_feed must be 'sip' or 'iex', got {feed!r}")
+    data = DataConfig(provider=provider, alpaca_feed=feed)
+
     risk = RiskConfig(**raw.get("risk", {}))
     paths = raw.get("paths", {})
     base = path.parent if path.exists() else Path(".")
@@ -93,6 +116,7 @@ def load_settings(
         broker=broker,
         risk=risk,
         universe=universe,
+        data=data,
         data_dir=base / paths.get("data_dir", "data"),
         state_dir=base / paths.get("state_dir", "state"),
     )

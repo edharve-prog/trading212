@@ -11,6 +11,12 @@ dry_run = true
 data_dir = "data"
 state_dir = "state"
 
+[data]
+# "alpaca" (needs ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY in .env) or "yfinance".
+provider = "alpaca"
+# "sip" = all US exchanges (free plan: data at least 15 minutes old), "iex" = IEX only.
+alpaca_feed = "sip"
+
 [universe]
 # Data-provider symbols (Yahoo style). Trading212 tickers are mapped separately.
 symbols = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "JPM", "XOM", "UNH", "COST"]

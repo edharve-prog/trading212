@@ -10,7 +10,8 @@ from datetime import date
 
 from .broker.t212_client import T212Client
 from .config import Settings, load_settings
-from .data.market_data import YFinanceProvider
+from .data.alpaca import AlpacaProvider
+from .data.market_data import MarketData, YFinanceProvider
 from .data.store import PriceStore
 
 log = logging.getLogger("t212bot")
@@ -25,6 +26,13 @@ def _client(settings: Settings) -> T212Client:
         allow_live=settings.broker.allow_live,
         dry_run=settings.broker.dry_run,
     )
+
+
+def _provider(settings: Settings) -> MarketData:
+    if settings.data.provider == "yfinance":
+        return YFinanceProvider()
+    key, secret = settings.alpaca_credentials()
+    return AlpacaProvider(key, secret, feed=settings.data.alpaca_feed)
 
 
 def cmd_account(settings: Settings, args: argparse.Namespace) -> int:
@@ -54,7 +62,7 @@ def cmd_instruments(settings: Settings, args: argparse.Namespace) -> int:
 def cmd_update_data(settings: Settings, args: argparse.Namespace) -> int:
     symbols = args.symbols or [*settings.universe.symbols, settings.universe.benchmark]
     store = PriceStore(settings.data_dir)
-    provider = YFinanceProvider()
+    provider = _provider(settings)
     start = date.fromisoformat(settings.universe.history_start)
     failures = 0
     for symbol in symbols:
