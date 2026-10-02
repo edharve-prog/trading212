@@ -4,11 +4,11 @@
 !.env.example
 
 # local config, data and state
-config.toml
-data/
-state/
-logs/
-STOP
+/config.toml
+/data/
+/state/
+/logs/
+/STOP
 
 # python
 __pycache__/
