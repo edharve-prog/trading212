@@ -17,6 +17,17 @@ provider = "alpaca"
 # "sip" = all US exchanges (free plan: data at least 15 minutes old), "iex" = IEX only.
 alpaca_feed = "sip"
 
+[llm]
+# OpenAI OAuth uses "Sign in with ChatGPT" and does not require an OpenAI API key.
+# "anthropic" is retained as a provider option for the planned Claude integration.
+provider = "openai_oauth"
+# Leave blank to discover the signed-in account's available models at runtime.
+model = ""
+# OAuth credentials live outside the repo with owner-only permissions on Unix.
+openai_credential_path = "~/.config/t212bot/openai_oauth.json"
+# Fixed loopback port makes SSH port-forwarding to a Raspberry Pi predictable.
+openai_callback_port = 1455
+
 [universe]
 # Data-provider symbols (Yahoo style). Trading212 tickers are mapped separately.
 symbols = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "JPM", "XOM", "UNH", "COST"]
