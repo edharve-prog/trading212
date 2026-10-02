@@ -36,3 +36,22 @@ def test_rejects_unknown_environment(tmp_path):
     cfg.write_text('[broker]\nenvironment = "paper"\n')
     with pytest.raises(ConfigError):
         load_settings(cfg, tmp_path / "x.env")
+
+
+def test_data_provider_defaults_to_alpaca(tmp_path, monkeypatch):
+    s = load_settings(tmp_path / "missing.toml", tmp_path / "missing.env")
+    assert s.data.provider == "alpaca"
+    assert s.data.alpaca_feed == "sip"
+    monkeypatch.delenv("ALPACA_API_KEY_ID", raising=False)
+    with pytest.raises(ConfigError):
+        s.alpaca_credentials()
+    monkeypatch.setenv("ALPACA_API_KEY_ID", "id")
+    monkeypatch.setenv("ALPACA_API_SECRET_KEY", "sk")
+    assert s.alpaca_credentials() == ("id", "sk")
+
+
+def test_rejects_unknown_data_provider(tmp_path):
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[data]\nprovider = "bloomberg"\n')
+    with pytest.raises(ConfigError):
+        load_settings(cfg, tmp_path / "x.env")

@@ -31,7 +31,9 @@ cp .env.example .env               # Windows: copy .env.example .env
 cp config.example.toml config.toml
 ```
 
-Put your Trading212 **demo** API key and secret in `.env` (Trading212 app: Settings > API).
+Put your Trading212 **demo** API key and secret in `.env` (Trading212 app: Settings > API),
+and your Alpaca API key ID and secret for price data. To use Yahoo Finance instead, set
+`provider = "yfinance"` under `[data]` in `config.toml`.
 On the Pi, run `chmod 600 .env`.
 
 ## Usage
@@ -58,6 +60,7 @@ uv run mypy
 src/t212bot/
   broker/t212_client.py   Trading212 REST client
   data/market_data.py     price provider interface + yfinance
+  data/alpaca.py          Alpaca market data provider (default)
   data/store.py           Parquet + DuckDB price store
   indicators.py           technical indicators
   config.py               config.toml + .env loading
