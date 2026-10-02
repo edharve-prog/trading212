@@ -475,7 +475,7 @@ class OpenAIOAuthClient:
         fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         try:
             if os.name != "nt":
-                os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+                os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(body, handle, indent=2)
                 handle.write("\n")
