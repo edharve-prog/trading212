@@ -13,6 +13,7 @@ from .config import Settings, load_settings
 from .data.alpaca import AlpacaProvider
 from .data.market_data import MarketData, YFinanceProvider
 from .data.store import PriceStore
+from .llm.openai_oauth import LLMError, OAuthError, OpenAIOAuthClient
 
 log = logging.getLogger("t212bot")
 
@@ -33,6 +34,10 @@ def _provider(settings: Settings) -> MarketData:
         return YFinanceProvider()
     key, secret = settings.alpaca_credentials()
     return AlpacaProvider(key, secret, feed=settings.data.alpaca_feed)
+
+
+def _openai(settings: Settings) -> OpenAIOAuthClient:
+    return OpenAIOAuthClient(credential_path=settings.llm.openai_credential_path)
 
 
 def cmd_account(settings: Settings, args: argparse.Namespace) -> int:
@@ -93,6 +98,73 @@ def cmd_indicators(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_llm_login(settings: Settings, args: argparse.Namespace) -> int:
+    port = args.port or settings.llm.openai_callback_port
+    with _openai(settings) as client:
+        status = client.login(
+            callback_port=port,
+            open_browser=not args.no_browser,
+            url_callback=(lambda url: print(f"Open this URL in a browser:\n{url}"))
+            if args.no_browser
+            else None,
+        )
+    account = status.email or status.client_id or "ChatGPT account"
+    print(f"Signed in: {account}")
+    if status.plan_enabled:
+        print("ChatGPT plan usage: enabled")
+        return 0
+    print("ChatGPT plan usage: not authorized")
+    return 1
+
+
+def cmd_llm_status(settings: Settings, args: argparse.Namespace) -> int:
+    with _openai(settings) as client:
+        status = client.status()
+    if not status.signed_in:
+        print("OpenAI OAuth: signed out")
+        return 1
+    print(f"OpenAI OAuth: signed in as {status.email or status.client_id}")
+    print(f"ChatGPT plan usage: {'enabled' if status.plan_enabled else 'disabled'}")
+    if status.expires_at:
+        print(f"Access token expires: {status.expires_at.isoformat()}")
+    return 0
+
+
+def cmd_llm_models(settings: Settings, args: argparse.Namespace) -> int:
+    with _openai(settings) as client:
+        models = client.list_models()
+    for model in models:
+        print(f"{model.slug}\t{model.display_name}")
+    return 0
+
+
+def cmd_llm_test(settings: Settings, args: argparse.Namespace) -> int:
+    with _openai(settings) as client:
+        model = args.model or settings.llm.model
+        if not model:
+            models = client.list_models()
+            if not models:
+                raise LLMError("No models are available for the signed-in ChatGPT account")
+            model = models[0].slug
+        output = client.respond(args.prompt, model=model)
+    print(output)
+    return 0
+
+
+def cmd_llm_logout(settings: Settings, args: argparse.Namespace) -> int:
+    with _openai(settings) as client:
+        revoked = client.logout()
+    print("Signed out locally.")
+    if not revoked:
+        print(
+            "Remote token revocation could not be confirmed; "
+            "disconnect the app in ChatGPT Settings."
+        )
+        return 1
+    print("Remote OAuth session revoked.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="t212bot")
     parser.add_argument("--config", default="config.toml")
@@ -113,6 +185,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("symbol")
     p.add_argument("--rows", type=int, default=10)
     p.set_defaults(func=cmd_indicators)
+
+    p = sub.add_parser("llm-login", help="Sign in with ChatGPT for OpenAI/Codex model access")
+    p.add_argument("--port", type=int, help="Loopback callback port (default from config)")
+    p.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Print the authorization URL instead of opening a browser",
+    )
+    p.set_defaults(func=cmd_llm_login)
+    sub.add_parser("llm-status", help="Show OpenAI OAuth status").set_defaults(func=cmd_llm_status)
+    sub.add_parser("llm-models", help="List models available to the ChatGPT account").set_defaults(
+        func=cmd_llm_models
+    )
+    p = sub.add_parser("llm-test", help="Run a small streamed Responses API request")
+    p.add_argument("--model", help="Model slug; defaults to [llm].model or the first listed model")
+    p.add_argument("--prompt", default="Reply with exactly: OK")
+    p.set_defaults(func=cmd_llm_test)
+    sub.add_parser("llm-logout", help="Revoke and clear the OpenAI OAuth session").set_defaults(
+        func=cmd_llm_logout
+    )
     return parser
 
 
@@ -123,7 +215,11 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     settings = load_settings(args.config, args.env_file)
-    return int(args.func(settings, args))
+    try:
+        return int(args.func(settings, args))
+    except (OAuthError, LLMError) as exc:
+        log.error("%s", exc)
+        return 1
 
 
 if __name__ == "__main__":
