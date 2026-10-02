@@ -18,6 +18,7 @@ def test_example_config_loads(tmp_path):
     s = load_settings(example, tmp_path / "missing.env")
     assert s.universe.benchmark == "SPY"
     assert s.risk.max_open_positions == 5
+    assert s.llm.provider == "openai_oauth"
 
 
 def test_credentials_by_environment(tmp_path, monkeypatch):
@@ -53,5 +54,27 @@ def test_data_provider_defaults_to_alpaca(tmp_path, monkeypatch):
 def test_rejects_unknown_data_provider(tmp_path):
     cfg = tmp_path / "config.toml"
     cfg.write_text('[data]\nprovider = "bloomberg"\n')
+    with pytest.raises(ConfigError):
+        load_settings(cfg, tmp_path / "x.env")
+
+
+def test_llm_config_can_select_openai_oauth(tmp_path):
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[llm]\nprovider = "openai_oauth"\nmodel = "gpt-test"\nopenai_callback_port = 1555\n'
+    )
+    s = load_settings(cfg, tmp_path / "x.env")
+    assert s.llm.provider == "openai_oauth"
+    assert s.llm.model == "gpt-test"
+    assert s.llm.openai_callback_port == 1555
+
+
+def test_rejects_unknown_llm_provider_and_bad_callback_port(tmp_path):
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[llm]\nprovider = "local"\n')
+    with pytest.raises(ConfigError):
+        load_settings(cfg, tmp_path / "x.env")
+
+    cfg.write_text('[llm]\nopenai_callback_port = 70000\n')
     with pytest.raises(ConfigError):
         load_settings(cfg, tmp_path / "x.env")
