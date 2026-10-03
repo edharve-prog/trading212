@@ -49,7 +49,8 @@ class DataConfig:
 
 @dataclass(frozen=True)
 class LLMConfig:
-    provider: Literal["anthropic", "openai_oauth"] = "openai_oauth"
+    # Only OpenAI OAuth is wired up; add a provider here once an LLM client exists for it.
+    provider: Literal["openai_oauth"] = "openai_oauth"
     model: str = ""
     openai_credential_path: str = "~/.config/t212bot/openai_oauth.json"
     openai_callback_port: int = 1455
@@ -120,9 +121,10 @@ def load_settings(
 
     llm_raw = raw.get("llm", {})
     llm_provider = llm_raw.get("provider", "openai_oauth")
-    if llm_provider not in ("anthropic", "openai_oauth"):
+    if llm_provider != "openai_oauth":
         raise ConfigError(
-            f"llm.provider must be 'anthropic' or 'openai_oauth', got {llm_provider!r}"
+            f"llm.provider must be 'openai_oauth' (the only provider implemented), "
+            f"got {llm_provider!r}"
         )
     callback_port = int(llm_raw.get("openai_callback_port", 1455))
     if not 1 <= callback_port <= 65535:
