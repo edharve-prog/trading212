@@ -19,7 +19,7 @@ alpaca_feed = "sip"
 
 [llm]
 # OpenAI OAuth uses "Sign in with ChatGPT" and does not require an OpenAI API key.
-# "anthropic" is retained as a provider option for the planned Claude integration.
+# "openai_oauth" is the only provider implemented so far.
 provider = "openai_oauth"
 # Leave blank to discover the signed-in account's available models at runtime.
 model = ""

@@ -78,3 +78,10 @@ def test_rejects_unknown_llm_provider_and_bad_callback_port(tmp_path):
     cfg.write_text("[llm]\nopenai_callback_port = 70000\n")
     with pytest.raises(ConfigError):
         load_settings(cfg, tmp_path / "x.env")
+
+
+def test_llm_provider_must_be_implemented(tmp_path):
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[llm]\nprovider = "anthropic"\n')
+    with pytest.raises(ConfigError, match="openai_oauth"):
+        load_settings(cfg, tmp_path / "x.env")

@@ -42,8 +42,25 @@ SCOPES = "openid profile email offline_access resource.invoke chatgpt.tokens.use
 CALLBACK_PATH = "/auth/callback"
 
 
+# Token-endpoint failures worth retrying: the request may succeed if sent again.
+TRANSIENT_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
 class OAuthError(RuntimeError):
     """OAuth registration, validation, refresh, or revocation failed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        error: str | None = None,
+        transient: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.error = error
+        self.transient = transient
 
 
 class LLMError(RuntimeError):
@@ -113,15 +130,21 @@ class OpenAIOAuthClient:
         credential_path: Path | str | None = None,
         agent_name: str = "t212bot",
         transport: httpx.BaseTransport | None = None,
-        timeout: float = 30.0,
+        http_timeout: float = 30.0,
+        callback_timeout: float = 300.0,
+        refresh_attempts: int = 3,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         default = Path.home() / ".config" / "t212bot" / "openai_oauth.json"
         self.credential_path = Path(credential_path).expanduser() if credential_path else default
         self.agent_name = agent_name
-        self.timeout = timeout
+        self.http_timeout = http_timeout
+        self.callback_timeout = callback_timeout
+        self.refresh_attempts = max(1, refresh_attempts)
         self._now = now
-        self._http = httpx.Client(timeout=timeout, transport=transport)
+        self._sleep = sleep
+        self._http = httpx.Client(timeout=http_timeout, transport=transport)
         self._thread_lock = threading.Lock()
 
     def close(self) -> None:
@@ -153,25 +176,34 @@ class OpenAIOAuthClient:
         browser_opener: Callable[[str], Any] = webbrowser.open,
         url_callback: Callable[[str], None] | None = None,
     ) -> AuthStatus:
-        """Run a loopback OAuth flow and persist the validated credentials."""
-        host_id, existing = self._load_state()
+        """Run a loopback OAuth flow and persist the validated credentials.
+
+        When the URL is shown to the user rather than opened directly (``--no-browser``),
+        the saved ID token is never put in it: the account selector is shown instead.
+        """
+        host_id, existing, pending_client_id = self._load_full_state()
         state = secrets.token_urlsafe(32)
         nonce = secrets.token_urlsafe(32)
         verifier = secrets.token_urlsafe(64)
         challenge = _b64url(hashlib.sha256(verifier.encode()).digest())
         callback: dict[str, str] = {}
+        ignored: list[str] = []
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(handler_self) -> None:  # noqa: N802
                 parsed = urlparse(handler_self.path)
-                if parsed.path != CALLBACK_PATH:
+                values = {k: v[0] for k, v in parse_qs(parsed.query).items() if v}
+                if callback or parsed.path != CALLBACK_PATH:
                     handler_self.send_response(404)
                     handler_self.end_headers()
                     return
-                values = parse_qs(parsed.query)
-                for name, items in values.items():
-                    if items:
-                        callback[name] = items[0]
+                if not secrets.compare_digest(values.get("state", ""), state):
+                    # A stale tab or stray request: keep waiting for the real callback.
+                    ignored.append("state mismatch")
+                    handler_self.send_response(400)
+                    handler_self.end_headers()
+                    return
+                callback.update(values)
                 handler_self.send_response(200)
                 handler_self.send_header("Content-Type", "text/html; charset=utf-8")
                 handler_self.end_headers()
@@ -185,9 +217,12 @@ class OpenAIOAuthClient:
         server = HTTPServer(("127.0.0.1", callback_port), Handler)
         actual_port = server.server_address[1]
         redirect_uri = f"http://127.0.0.1:{actual_port}{CALLBACK_PATH}"
-        pending_client_id = existing.client_id if existing else DYNAMIC_CLIENT_ID
+        if existing:
+            request_client_id = existing.client_id
+        else:
+            request_client_id = pending_client_id or DYNAMIC_CLIENT_ID
         params = {
-            "client_id": pending_client_id,
+            "client_id": request_client_id,
             "ext_agent_host_id": host_id,
             "response_type": "code",
             "redirect_uri": redirect_uri,
@@ -198,8 +233,11 @@ class OpenAIOAuthClient:
             "code_challenge_method": "S256",
             "code_challenge": challenge,
         }
+        url_is_shown = url_callback is not None or not open_browser
         if existing:
-            if existing.id_token:
+            # id_token_hint must never reach logs or a terminal; only send it when the URL
+            # goes straight to the browser.
+            if existing.id_token and not url_is_shown:
                 params["id_token_hint"] = existing.id_token
             if existing.email:
                 params["login_hint"] = existing.email
@@ -207,23 +245,28 @@ class OpenAIOAuthClient:
             params["agent_name_hint"] = self.agent_name
 
         authorization_url = f"{AUTHORIZE_URL}?{urlencode(params)}"
-        if url_callback:
-            url_callback(authorization_url)
-        if open_browser and not browser_opener(authorization_url):
-            server.server_close()
-            raise OAuthError(
-                "Could not open a browser; rerun with --no-browser and open the URL manually"
-            )
-
-        server.timeout = self.timeout
         try:
-            server.handle_request()
+            if url_callback:
+                url_callback(authorization_url)
+            if open_browser and not browser_opener(authorization_url):
+                raise OAuthError(
+                    "Could not open a browser; rerun with --no-browser and open the URL manually"
+                )
+            deadline = time.monotonic() + self.callback_timeout
+            while not callback:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                server.timeout = min(remaining, 1.0)
+                server.handle_request()
         finally:
             server.server_close()
         if not callback:
-            raise OAuthError("Timed out waiting for the OpenAI OAuth callback")
-        if callback.get("state") != state:
-            raise OAuthError("OAuth callback state did not match the pending sign-in")
+            detail = f" (ignored: {', '.join(ignored)})" if ignored else ""
+            raise OAuthError(
+                f"Timed out after {self.callback_timeout:.0f}s waiting for the OpenAI "
+                f"OAuth callback{detail}"
+            )
         if callback.get("error"):
             raise OAuthError(f"OpenAI authorization failed: {callback['error']}")
         code = callback.get("code")
@@ -231,29 +274,43 @@ class OpenAIOAuthClient:
             raise OAuthError("OAuth callback did not include an authorization code")
 
         returned_client_id = callback.get("client_id")
-        if existing:
-            if returned_client_id and returned_client_id != existing.client_id:
+        if existing or pending_client_id:
+            expected = existing.client_id if existing else pending_client_id
+            if returned_client_id and returned_client_id != expected:
                 raise OAuthError(
-                    "OAuth callback returned a different client_id for the saved account"
+                    "OAuth callback returned a different client_id for the saved registration"
                 )
-            issued_client_id = existing.client_id
+            issued_client_id = str(expected)
         else:
             if not returned_client_id or returned_client_id == DYNAMIC_CLIENT_ID:
                 raise OAuthError(
                     "OpenAI did not return an issued client_id for the new registration"
                 )
             issued_client_id = returned_client_id
+            # Keep the issued ID before exchanging the code, so a retry after invalid_grant
+            # restarts authorization with it instead of registering again.
+            self._save_state(host_id, None, pending_client_id=issued_client_id)
 
-        token_response = self._post_token(
-            {
-                "grant_type": "authorization_code",
-                "client_id": issued_client_id,
-                "code": code,
-                "code_verifier": verifier,
-                "redirect_uri": redirect_uri,
-                "resource": RESOURCE,
-            }
-        )
+        try:
+            token_response = self._post_token(
+                {
+                    "grant_type": "authorization_code",
+                    "client_id": issued_client_id,
+                    "code": code,
+                    "code_verifier": verifier,
+                    "redirect_uri": redirect_uri,
+                    "resource": RESOURCE,
+                }
+            )
+        except OAuthError as exc:
+            if exc.error == "invalid_grant":
+                raise OAuthError(
+                    "The authorization code was rejected (invalid_grant). "
+                    "Run `t212bot llm-login` again; the issued client ID has been kept.",
+                    status=exc.status,
+                    error=exc.error,
+                ) from exc
+            raise
         id_token = _require_string(token_response, "id_token")
         claims = self._verify_id_token(id_token, issued_client_id, nonce)
         if existing and (claims["iss"], claims["sub"]) != (existing.issuer, existing.subject):
@@ -285,7 +342,8 @@ class OpenAIOAuthClient:
         if DIRECT_SCOPE not in (profile.scopes or []):
             raise OAuthError("ChatGPT plan usage was not authorized for this connection")
         if self._needs_refresh(profile):
-            profile = self.refresh()
+            # force=False: after taking the lock, reuse a token another process just refreshed.
+            profile = self.refresh(force=False)
         if not profile.access_token:
             raise OAuthError("Saved OpenAI credentials do not contain an access token")
         return profile.access_token
@@ -298,14 +356,7 @@ class OpenAIOAuthClient:
                 raise OAuthError("No renewable OpenAI session is stored")
             if not force and not self._needs_refresh(profile):
                 return profile
-            data = self._post_token(
-                {
-                    "grant_type": "refresh_token",
-                    "client_id": profile.client_id,
-                    "refresh_token": profile.refresh_token,
-                    "resource": RESOURCE,
-                }
-            )
+            data = self._refresh_with_retry(profile)
             new_access = _require_string(data, "access_token")
             new_refresh = _require_string(data, "refresh_token")
             profile.access_token = new_access
@@ -319,6 +370,41 @@ class OpenAIOAuthClient:
             profile.earliest_refresh_at = data.get("earliest_refresh_at")
             self._save_state(profile.ext_agent_host_id, profile)
             return profile
+
+    def _refresh_with_retry(self, profile: _Profile) -> dict[str, Any]:
+        """Retry transient failures with backoff; clear the session on terminal ones."""
+        request = {
+            "grant_type": "refresh_token",
+            "client_id": profile.client_id,
+            "refresh_token": str(profile.refresh_token),
+            "resource": RESOURCE,
+        }
+        for attempt in range(self.refresh_attempts):
+            try:
+                return self._post_token(request)
+            except OAuthError as exc:
+                if exc.transient and attempt + 1 < self.refresh_attempts:
+                    self._sleep(float(2**attempt))
+                    continue
+                if not exc.transient:
+                    self._clear_tokens(profile)
+                    raise OAuthError(
+                        f"The OpenAI session can no longer be refreshed ({exc}). "
+                        "Run `t212bot llm-login` to sign in again.",
+                        status=exc.status,
+                        error=exc.error,
+                    ) from exc
+                raise
+        raise AssertionError("unreachable")
+
+    def _clear_tokens(self, profile: _Profile) -> None:
+        profile.id_token = None
+        profile.access_token = None
+        profile.refresh_token = None
+        profile.expires_in = 0
+        profile.scopes = []
+        profile.saved_at = None
+        self._save_state(profile.ext_agent_host_id, profile)
 
     def logout(self) -> bool:
         """Attempt remote refresh-token revocation and clear local tokens regardless."""
@@ -344,23 +430,23 @@ class OpenAIOAuthClient:
                 revoked = response.status_code == 200
             except (httpx.HTTPError, OAuthError, ValueError):
                 revoked = False
-        profile.id_token = None
-        profile.access_token = None
-        profile.refresh_token = None
-        profile.expires_in = 0
-        profile.scopes = []
-        profile.saved_at = None
-        self._save_state(host_id, profile)
+        self._clear_tokens(profile)
         return revoked
 
     def list_models(self) -> list[ModelInfo]:
-        response = self._http.get(
-            f"{API_BASE_URL}/models",
-            headers={"Authorization": f"Bearer {self.access_token()}"},
-        )
+        try:
+            response = self._http.get(
+                f"{API_BASE_URL}/models",
+                headers={"Authorization": f"Bearer {self.access_token()}"},
+            )
+        except httpx.HTTPError as exc:
+            raise LLMError(f"OpenAI model discovery failed: {exc}") from exc
         if response.is_error:
             raise LLMError(_http_error("OpenAI model discovery failed", response))
-        body = response.json()
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise LLMError(f"OpenAI model discovery returned invalid JSON: {exc}") from exc
         models = body.get("models", body.get("data", []))
         result = []
         for item in models:
@@ -387,33 +473,63 @@ class OpenAIOAuthClient:
         }
         pieces: list[str] = []
         completed = False
-        with self._http.stream(
-            "POST", f"{API_BASE_URL}/responses", headers=headers, json=payload
-        ) as response:
-            if response.is_error:
-                response.read()
-                raise LLMError(_http_error("OpenAI Responses request failed", response))
-            for event in _sse_events(response.iter_lines()):
-                kind = event.get("type")
-                if kind == "response.output_text.delta":
-                    pieces.append(str(event.get("delta", "")))
-                elif kind == "response.failed":
-                    error = (event.get("response") or {}).get("error") or {}
-                    code = error.get("code", "unknown_error")
-                    raise LLMError(f"OpenAI response failed: {code}")
-                elif kind == "response.incomplete":
-                    raise LLMError("OpenAI response was incomplete")
-                elif kind == "response.completed":
-                    completed = True
+        request_id: str | None = None
+        try:
+            with self._http.stream(
+                "POST", f"{API_BASE_URL}/responses", headers=headers, json=payload
+            ) as response:
+                request_id = _request_id(response)
+                if response.is_error:
+                    response.read()
+                    raise LLMError(_http_error("OpenAI Responses request failed", response))
+                for event in _sse_events(response.iter_lines()):
+                    kind = event.get("type")
+                    if kind == "response.output_text.delta":
+                        pieces.append(str(event.get("delta", "")))
+                    elif kind == "response.failed":
+                        error = (event.get("response") or {}).get("error") or {}
+                        raise LLMError(_describe_failure(error, request_id))
+                    elif kind == "response.incomplete":
+                        details = (event.get("response") or {}).get("incomplete_details") or {}
+                        reason = details.get("reason", "unknown reason")
+                        raise LLMError(
+                            f"OpenAI response was incomplete: {reason}{_rid(request_id)}"
+                        )
+                    elif kind == "response.completed":
+                        completed = True
+        except httpx.HTTPError as exc:
+            raise LLMError(f"OpenAI Responses request failed: {exc}{_rid(request_id)}") from exc
+        except json.JSONDecodeError as exc:
+            raise LLMError(
+                f"OpenAI Responses stream had a malformed event: {exc}{_rid(request_id)}"
+            ) from exc
         if not completed:
-            raise LLMError("OpenAI response stream ended without response.completed")
+            raise LLMError(
+                f"OpenAI response stream ended without response.completed{_rid(request_id)}"
+            )
         return "".join(pieces)
 
     def _post_token(self, data: dict[str, str]) -> dict[str, Any]:
-        response = self._http.post(TOKEN_URL, data=data)
+        try:
+            response = self._http.post(TOKEN_URL, data=data)
+        except httpx.TransportError as exc:
+            raise OAuthError(f"OpenAI token request failed: {exc}", transient=True) from exc
         if response.is_error:
-            raise OAuthError(_http_error("OpenAI token exchange failed", response))
-        body: dict[str, Any] = response.json()
+            error: str | None = None
+            with suppress(ValueError, AttributeError):
+                error = response.json().get("error")
+            raise OAuthError(
+                _http_error("OpenAI token exchange failed", response),
+                status=response.status_code,
+                error=error if isinstance(error, str) else None,
+                transient=response.status_code in TRANSIENT_STATUSES,
+            )
+        try:
+            body: dict[str, Any] = response.json()
+        except ValueError as exc:
+            raise OAuthError(
+                f"OpenAI token endpoint returned invalid JSON: {exc}", transient=True
+            ) from exc
         return body
 
     def _verify_id_token(self, token: str, client_id: str, nonce: str) -> dict[str, Any]:
@@ -446,10 +562,14 @@ class OpenAIOAuthClient:
         return claims
 
     def _load_state(self) -> tuple[str, _Profile | None]:
+        host_id, profile, _ = self._load_full_state()
+        return host_id, profile
+
+    def _load_full_state(self) -> tuple[str, _Profile | None, str | None]:
         if not self.credential_path.exists():
             host_id = f"urn:uuid:{uuid.uuid4()}"
             self._save_state(host_id, None)
-            return host_id, None
+            return host_id, None, None
         try:
             raw = json.loads(self.credential_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -459,19 +579,24 @@ class OpenAIOAuthClient:
             raise OAuthError("OpenAI credential file is missing ext_agent_host_id")
         profile_raw = raw.get("profile")
         profile = _Profile.from_dict(profile_raw) if isinstance(profile_raw, dict) else None
-        return host_id, profile
+        pending = raw.get("pending_client_id")
+        return host_id, profile, pending if isinstance(pending, str) and pending else None
 
     def _load_profile(self) -> _Profile | None:
         return self._load_state()[1]
 
-    def _save_state(self, host_id: str, profile: _Profile | None) -> None:
+    def _save_state(
+        self, host_id: str, profile: _Profile | None, *, pending_client_id: str | None = None
+    ) -> None:
         path = self.credential_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        body = {
+        body: dict[str, Any] = {
             "version": 1,
             "ext_agent_host_id": host_id,
             "profile": profile.as_dict() if profile else None,
         }
+        if pending_client_id:
+            body["pending_client_id"] = pending_client_id
         fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         try:
             if os.name != "nt":
@@ -542,8 +667,25 @@ def _b64url(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
+def _request_id(response: httpx.Response) -> str | None:
+    return response.headers.get("openai-request-id") or response.headers.get("x-request-id")
+
+
+def _rid(request_id: str | None) -> str:
+    return f" (request id {request_id})" if request_id else ""
+
+
+def _describe_failure(error: dict[str, Any], request_id: str | None) -> str:
+    parts = [str(error.get("code") or "unknown_error")]
+    if error.get("message"):
+        parts.append(str(error["message"]))
+    if error.get("param"):
+        parts.append(f"param={error['param']}")
+    return f"OpenAI response failed: {': '.join(parts)}{_rid(request_id)}"
+
+
 def _http_error(prefix: str, response: httpx.Response) -> str:
-    request_id = response.headers.get("openai-request-id") or response.headers.get("x-request-id")
+    request_id = _request_id(response)
     try:
         body: Any = response.json()
     except ValueError:
