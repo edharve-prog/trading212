@@ -6,26 +6,63 @@ import argparse
 import json
 import logging
 import sys
+from collections.abc import Callable
 from datetime import date
+from typing import Any
 
+from .broker.demo_order_check import NotDemoError, run_demo_order_check
 from .broker.t212_client import T212Client
-from .config import Settings, load_settings
+from .config import ConfigError, Settings, load_settings
 from .data.alpaca import AlpacaProvider
 from .data.market_data import MarketData, YFinanceProvider
 from .data.store import PriceStore
+from .journal import Journal
 from .llm.openai_oauth import LLMError, OAuthError, OpenAIOAuthClient
 
 log = logging.getLogger("t212bot")
 
+# Commands not written to the run journal (long-running or read-only noise).
+UNJOURNALED = {"dashboard"}
 
-def _client(settings: Settings) -> T212Client:
+
+def _journal(settings: Settings) -> Journal:
+    return Journal(settings.state_dir / "journal.sqlite")
+
+
+def _order_journaler(
+    settings: Settings, run_id: int | None, environment: str, dry_run: bool
+) -> Callable[[str, dict[str, Any], Any], None]:
+    journal = _journal(settings)
+
+    def record(kind: str, payload: dict[str, Any], result: Any) -> None:
+        journal.record_order(run_id, environment, dry_run, kind, payload, result)
+
+    return record
+
+
+def _client(settings: Settings, run_id: int | None = None) -> T212Client:
     key, secret = settings.t212_credentials()
+    broker = settings.broker
     return T212Client(
         key,
         secret,
-        settings.broker.environment,
-        allow_live=settings.broker.allow_live,
-        dry_run=settings.broker.dry_run,
+        broker.environment,
+        allow_live=broker.allow_live,
+        dry_run=broker.dry_run,
+        on_order=_order_journaler(settings, run_id, broker.environment, broker.dry_run),
+    )
+
+
+def _demo_client(settings: Settings, run_id: int | None = None) -> T212Client:
+    """A client that can only reach the demo account and really sends orders."""
+    key, secret = settings.t212_demo_credentials()
+    return T212Client(
+        key,
+        secret,
+        "demo",
+        allow_live=False,
+        dry_run=False,
+        on_order=_order_journaler(settings, run_id, "demo", False),
     )
 
 
@@ -49,6 +86,65 @@ def cmd_account(settings: Settings, args: argparse.Namespace) -> int:
     print(f"Open positions: {len(positions)}")
     for p in positions:
         print(f"  {p.get('ticker', p)}")
+    return 0
+
+
+def cmd_orders(settings: Settings, args: argparse.Namespace) -> int:
+    with _client(settings) as client:
+        orders = client.orders()
+    print(f"Environment: {settings.broker.environment}")
+    print(f"Open orders: {len(orders)}")
+    for o in orders:
+        print("  " + json.dumps(o))
+    return 0
+
+
+def cmd_demo_order_test(settings: Settings, args: argparse.Namespace) -> int:
+    if settings.broker.environment != "demo":
+        print(
+            "Refusing: broker.environment is 'live'. The order test only runs against the "
+            'demo account; set environment = "demo" in config.toml first.'
+        )
+        return 2
+    if args.fill:
+        plan = f"market BUY then market SELL {args.quantity:g} {args.ticker} (fills on demo)"
+    else:
+        plan = (
+            f"limit BUY {args.quantity:g} {args.ticker} below market, and a limit SELL above "
+            "market if you hold it; each is cancelled straight away"
+        )
+    print(f"Trading212 DEMO account: {plan}.")
+    if not args.yes and input("Type 'yes' to continue: ").strip().lower() != "yes":
+        print("Cancelled.")
+        return 1
+    with _demo_client(settings, args.run_id) as client:
+        result = run_demo_order_check(
+            client,
+            args.ticker,
+            args.quantity,
+            fill=args.fill,
+            buy_price=args.buy_price,
+            sell_price=args.sell_price,
+            offset=args.offset,
+            fill_timeout=args.fill_timeout,
+        )
+    for step in result.steps:
+        print(f"[{'PASS' if step.ok else 'FAIL'}] {step.name}: {step.detail}")
+    print("All steps passed." if result.ok else "Some steps failed.")
+    return 0 if result.ok else 1
+
+
+def cmd_dashboard(settings: Settings, args: argparse.Namespace) -> int:
+    from .dashboard import BindError, DashboardData, serve
+
+    data = DashboardData(settings, lambda: _client(settings), _journal(settings), ttl=args.ttl)
+    try:
+        serve(data, args.host, args.port, args.allow_host)
+    except BindError as exc:
+        print(exc)
+        return 2
+    except KeyboardInterrupt:
+        pass
     return 0
 
 
@@ -175,6 +271,37 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("account", help="Show account summary and positions").set_defaults(
         func=cmd_account
     )
+    sub.add_parser("orders", help="List open (pending) orders").set_defaults(func=cmd_orders)
+    p = sub.add_parser(
+        "demo-order-test",
+        help="Place and cancel a small buy and sell on the Trading212 DEMO account only",
+    )
+    p.add_argument("ticker", help="Trading212 ticker, e.g. AAPL_US_EQ")
+    p.add_argument("--quantity", type=float, default=1.0, help="Shares per order (default 1)")
+    p.add_argument("--buy-price", type=float, help="Limit buy price (default: 10%% below)")
+    p.add_argument("--sell-price", type=float, help="Limit sell price (default: 10%% above)")
+    p.add_argument(
+        "--offset", type=float, default=0.10, help="Distance from current price (default 0.10)"
+    )
+    p.add_argument(
+        "--fill",
+        action="store_true",
+        help="Market buy then market sell instead (fills on demo; needs the market open)",
+    )
+    p.add_argument("--fill-timeout", type=float, default=60.0, help="Seconds to wait for a fill")
+    p.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt")
+    p.set_defaults(func=cmd_demo_order_test)
+    p = sub.add_parser("dashboard", help="Serve the read-only web dashboard")
+    p.add_argument("--host", default="127.0.0.1", help="Loopback or Tailscale IP")
+    p.add_argument("--port", type=int, default=8212)
+    p.add_argument(
+        "--allow-host",
+        action="append",
+        default=[],
+        help="Extra hostname accepted in the Host header (repeatable)",
+    )
+    p.add_argument("--ttl", type=float, default=30.0, help="Seconds to cache broker data")
+    p.set_defaults(func=cmd_dashboard)
     sub.add_parser("instruments", help="Save the Trading212 instrument list").set_defaults(
         func=cmd_instruments
     )
@@ -215,11 +342,32 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     settings = load_settings(args.config, args.env_file)
+    journal = None if args.command in UNJOURNALED else _journal(settings)
+    environment = "demo" if args.command == "demo-order-test" else settings.broker.environment
+    dry_run = False if args.command == "demo-order-test" else settings.broker.dry_run
+    args.run_id = None
+    if journal is not None:
+        try:
+            args.run_id = journal.start_run(args.command, environment, dry_run)
+        except Exception as exc:  # never let the journal stop a command
+            log.warning("could not write run journal: %s", exc)
+            journal = None
+    code, error = 1, None
     try:
-        return int(args.func(settings, args))
-    except (OAuthError, LLMError) as exc:
+        code = int(args.func(settings, args))
+    except (OAuthError, LLMError, ConfigError, NotDemoError) as exc:
+        error = str(exc)
         log.error("%s", exc)
-        return 1
+    except BaseException as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        if journal is not None and args.run_id is not None:
+            try:
+                journal.finish_run(args.run_id, code, error)
+            except Exception as exc:
+                log.warning("could not update run journal: %s", exc)
+    return code
 
 
 if __name__ == "__main__":
