@@ -1,0 +1,26 @@
+# Read-only t212bot dashboard on the Raspberry Pi.
+# Install:  sudo cp deploy/t212bot-dashboard.service /etc/systemd/system/
+#           (edit User and the /home/pi/trading212 paths first; run `uv sync` and
+#           `mkdir -p state` in the checkout so the paths below exist)
+#           sudo systemctl daemon-reload && sudo systemctl enable --now t212bot-dashboard
+# Then reach it from your tailnet with:  sudo tailscale serve --bg 8212
+[Unit]
+Description=t212bot read-only dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/trading212
+ExecStart=/home/pi/trading212/.venv/bin/t212bot dashboard --host 127.0.0.1 --port 8212
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/pi/trading212/state
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

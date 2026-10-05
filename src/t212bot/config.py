@@ -67,12 +67,11 @@ class Settings:
     state_dir: Path = Path("state")
 
     def t212_credentials(self) -> tuple[str, str]:
-        prefix = "T212_LIVE" if self.broker.environment == "live" else "T212_DEMO"
-        key = os.environ.get(f"{prefix}_API_KEY", "")
-        secret = os.environ.get(f"{prefix}_API_SECRET", "")
-        if not key or not secret:
-            raise ConfigError(f"{prefix}_API_KEY and {prefix}_API_SECRET must be set in .env")
-        return key, secret
+        return _t212_credentials("T212_LIVE" if self.broker.environment == "live" else "T212_DEMO")
+
+    def t212_demo_credentials(self) -> tuple[str, str]:
+        """Demo keys regardless of broker.environment (for demo-only tools)."""
+        return _t212_credentials("T212_DEMO")
 
     def alpaca_credentials(self) -> tuple[str, str]:
         key = os.environ.get("ALPACA_API_KEY_ID", "")
@@ -80,6 +79,14 @@ class Settings:
         if not key or not secret:
             raise ConfigError("ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY must be set in .env")
         return key, secret
+
+
+def _t212_credentials(prefix: str) -> tuple[str, str]:
+    key = os.environ.get(f"{prefix}_API_KEY", "")
+    secret = os.environ.get(f"{prefix}_API_SECRET", "")
+    if not key or not secret:
+        raise ConfigError(f"{prefix}_API_KEY and {prefix}_API_SECRET must be set in .env")
+    return key, secret
 
 
 def load_settings(

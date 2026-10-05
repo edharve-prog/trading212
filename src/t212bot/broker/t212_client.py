@@ -28,6 +28,10 @@ BASE_URLS = {
 
 TimeValidity = Literal["DAY", "GOOD_TILL_CANCEL"]
 
+# Called after every order placement or cancel (dry run included) with
+# (kind, payload, result). Used to journal orders.
+OrderListener = Callable[[str, dict[str, Any], Any], None]
+
 # Minimum seconds between calls to each endpoint, taken from the documented limits.
 # Order placement limits are not on the overview page; these are conservative guesses
 # to be checked against the per-endpoint reference on the demo account.
@@ -81,6 +85,7 @@ class T212Client:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
+        on_order: OrderListener | None = None,
     ):
         if environment not in BASE_URLS:
             raise ValueError(f"environment must be 'demo' or 'live', got {environment!r}")
@@ -91,6 +96,7 @@ class T212Client:
         self._sleep = sleep
         self._clock = clock
         self._wall_clock = wall_clock
+        self._on_order = on_order
         self._last_call: dict[str, float] = {}
         self._http = httpx.Client(
             base_url=BASE_URLS[environment],
@@ -158,8 +164,19 @@ class T212Client:
             )
         if self.dry_run:
             log.info("DRY RUN %s order: %s", kind, payload)
-            return DryRunOrder(kind=kind, payload=payload)
-        return self._request("POST", f"/equity/orders/{kind}", kind, json=payload)
+            result: Any = DryRunOrder(kind=kind, payload=payload)
+        else:
+            result = self._request("POST", f"/equity/orders/{kind}", kind, json=payload)
+        self._notify(kind, payload, result)
+        return result
+
+    def _notify(self, kind: str, payload: dict[str, Any], result: Any) -> None:
+        if self._on_order is None:
+            return
+        try:
+            self._on_order(kind, payload, result)
+        except Exception:  # journaling must never break order handling
+            log.exception("order listener failed for %s", kind)
 
     # ---- account ------------------------------------------------------
 
@@ -180,8 +197,9 @@ class T212Client:
     def cancel_order(self, order_id: int) -> None:
         if self.dry_run:
             log.info("DRY RUN cancel order %s", order_id)
-            return
-        self._request("DELETE", f"/equity/orders/{order_id}", "cancel")
+        else:
+            self._request("DELETE", f"/equity/orders/{order_id}", "cancel")
+        self._notify("cancel", {"orderId": order_id}, None)
 
     def place_market_order(
         self, ticker: str, quantity: float, *, extended_hours: bool = False
